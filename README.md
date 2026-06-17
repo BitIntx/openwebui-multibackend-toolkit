@@ -235,7 +235,35 @@ TAVILY_API_KEY=...
 
 키가 없으면 DuckDuckGo fallback으로 시도합니다.
 
-## 6. Cloudflare Quick Tunnel
+## 6. Local Media Server for Video URLs
+
+Open WebUI의 파일 업로드가 vLLM `video_url`로 잘 전달되지 않을 때는 같은 컨테이너 안의 로컬 HTTP 서버로 우회할 수 있습니다. 기본 공개 폴더는 `/workspace/media`이고 외부에는 노출하지 않도록 `127.0.0.1:9000`에만 바인딩합니다.
+
+```bash
+mkdir -p /workspace/media
+cp ~/me.mp4 /workspace/media/me.mp4
+
+cd vast-vllm-openwebui-gemma4
+bash scripts/run-local-media-server.sh
+```
+
+Open WebUI에서는 도구를 켠 뒤 이렇게 물어봅니다.
+
+```text
+inspect_video 도구로 http://127.0.0.1:9000/me.mp4 영상을 보고 장면을 설명해줘.
+```
+
+이 `127.0.0.1`은 사용자의 브라우저 기기가 아니라 Vast 컨테이너 내부에서 tool server와 vLLM이 접근하는 주소입니다. 파일명에 공백이 있으면 URL 인코딩을 쓰거나 파일명을 단순하게 바꾸는 편이 낫습니다.
+
+환경 변수:
+
+```bash
+LOCAL_MEDIA_HOST=127.0.0.1
+LOCAL_MEDIA_PORT=9000
+LOCAL_MEDIA_DIR=/workspace/media
+```
+
+## 7. Cloudflare Quick Tunnel
 
 새 터미널에서:
 
@@ -246,7 +274,7 @@ bash scripts/run-cloudflare.sh
 
 로그에 나오는 `https://*.trycloudflare.com` 주소로 접속합니다. Quick tunnel은 임시 주소라 재시작하면 바뀔 수 있습니다.
 
-## 7. API Smoke Test
+## 8. API Smoke Test
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
