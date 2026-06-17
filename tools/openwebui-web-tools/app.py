@@ -1,6 +1,7 @@
 import os
 import re
 import urllib.parse
+from html.parser import HTMLParser
 from html import unescape
 from typing import Any
 
@@ -17,11 +18,11 @@ DEFAULT_MODEL = "AEON-7/Gemma-4-26B-A4B-it-Uncensored-NVFP4"
 app = FastAPI(
     title=APP_TITLE,
     description=(
-        "OpenAPI tool server for Open WebUI. Provides web search, image search, "
-        "image inspection, and direct video URL inspection through the local "
-        "vLLM OpenAI-compatible endpoint."
+        "OpenAPI tool server for Open WebUI. Provides web search, webpage reading, "
+        "image search, media URL resolution, image inspection, and direct video URL "
+        "inspection through the local vLLM OpenAI-compatible endpoint."
     ),
-    version="0.1.0",
+    version="0.2.0",
 )
 
 app.add_middleware(
@@ -41,6 +42,21 @@ class WebSearchRequest(BaseModel):
 class ImageSearchRequest(BaseModel):
     query: str = Field(..., description="Image search query.")
     max_results: int = Field(5, ge=1, le=10, description="Maximum number of image results.")
+
+
+class ReadWebpageRequest(BaseModel):
+    url: str = Field(..., description="HTTP(S) webpage URL to fetch and summarize as text.")
+    max_chars: int = Field(12000, ge=1000, le=50000, description="Maximum extracted text characters to return.")
+
+
+class ResolveMediaUrlRequest(BaseModel):
+    url: str = Field(..., description="Direct media URL or webpage URL to inspect for media candidates.")
+    media_type: str = Field(
+        "video",
+        pattern="^(video|image|audio|any)$",
+        description="Preferred media type to resolve.",
+    )
+    max_results: int = Field(8, ge=1, le=20, description="Maximum candidate URLs to return.")
 
 
 class InspectImageRequest(BaseModel):
@@ -72,10 +88,88 @@ def _client() -> httpx.AsyncClient:
     )
 
 
+class _ReadableHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.skip_depth = 0
+        self.title_parts: list[str] = []
+        self.text_parts: list[str] = []
+        self.meta: dict[str, str] = {}
+        self.links: list[dict[str, str]] = []
+        self.media: list[dict[str, str]] = []
+        self._in_title = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        attr = {key.lower(): value or "" for key, value in attrs}
+        if tag in {"script", "style", "noscript", "svg", "canvas"}:
+            self.skip_depth += 1
+            return
+        if self.skip_depth:
+            return
+        if tag == "title":
+            self._in_title = True
+        if tag == "meta":
+            key = attr.get("property") or attr.get("name")
+            content = attr.get("content")
+            if key and content:
+                self.meta[key.lower()] = content.strip()
+        if tag == "a" and attr.get("href"):
+            self.links.append({"text": "", "url": attr["href"]})
+        if tag in {"video", "audio", "source", "img"}:
+            src = attr.get("src") or attr.get("data-src")
+            if src:
+                kind = "image" if tag == "img" else "audio" if tag == "audio" else "video"
+                self.media.append({"url": src, "type": attr.get("type") or kind, "source": tag})
+        if tag in {"p", "br", "div", "section", "article", "li", "tr", "h1", "h2", "h3", "h4"}:
+            self.text_parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style", "noscript", "svg", "canvas"} and self.skip_depth:
+            self.skip_depth -= 1
+            return
+        if self.skip_depth:
+            return
+        if tag == "title":
+            self._in_title = False
+        if tag in {"p", "li", "tr", "h1", "h2", "h3", "h4"}:
+            self.text_parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self.skip_depth:
+            return
+        value = data.strip()
+        if not value:
+            return
+        if self._in_title:
+            self.title_parts.append(value)
+        self.text_parts.append(value)
+        self.text_parts.append(" ")
+
+
 def _clean_text(value: str) -> str:
     value = re.sub(r"<[^>]+>", " ", value)
     value = unescape(value)
     return re.sub(r"\s+", " ", value).strip()
+
+
+def _normalize_text(value: str, max_chars: int | None = None) -> str:
+    lines = []
+    for line in value.splitlines():
+        cleaned = re.sub(r"[ \t]+", " ", line).strip()
+        if cleaned:
+            lines.append(cleaned)
+    text = "\n".join(lines)
+    if max_chars is not None and len(text) > max_chars:
+        return text[:max_chars].rstrip() + "\n...[truncated]"
+    return text
+
+
+def _require_http_url(url: str, field_name: str = "url") -> str:
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail=f"{field_name} must start with http:// or https://")
+    return url
 
 
 def _decode_ddg_href(href: str) -> str:
@@ -95,9 +189,48 @@ def _looks_like_direct_video_url(url: str) -> bool:
     return path.endswith((".mp4", ".webm", ".mov", ".m4v"))
 
 
+def _guess_media_type(url: str, content_type: str | None = None) -> str:
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    if ctype.startswith("video/"):
+        return "video"
+    if ctype.startswith("image/"):
+        return "image"
+    if ctype.startswith("audio/"):
+        return "audio"
+    path = urllib.parse.urlparse(url).path.lower()
+    if path.endswith((".mp4", ".webm", ".mov", ".m4v", ".mkv", ".avi")):
+        return "video"
+    if path.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
+        return "image"
+    if path.endswith((".mp3", ".wav", ".ogg", ".m4a", ".flac")):
+        return "audio"
+    if path.endswith((".m3u8", ".mpd")):
+        return "video"
+    return "unknown"
+
+
+def _is_media_candidate(url: str, preferred: str = "any", content_type: str | None = None) -> bool:
+    kind = _guess_media_type(url, content_type)
+    if preferred == "any":
+        return kind in {"video", "image", "audio"}
+    return kind == preferred
+
+
+def _absolute_url(base_url: str, candidate: str) -> str:
+    return urllib.parse.urljoin(base_url, unescape(candidate).strip())
+
+
+async def _fetch_url(url: str) -> tuple[httpx.Response, str]:
+    _require_http_url(url)
+    async with _client() as client:
+        res = await client.get(url)
+        res.raise_for_status()
+    content_type = res.headers.get("content-type", "")
+    return res, content_type
+
+
 async def _validate_direct_video_url(url: str) -> dict[str, Any]:
-    if not url.startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="video_url must start with http:// or https://")
+    _require_http_url(url, "video_url")
 
     metadata: dict[str, Any] = {"content_type": None, "content_length": None, "validated_by": "extension"}
     if _looks_like_direct_video_url(url):
@@ -129,6 +262,140 @@ async def _validate_direct_video_url(url: str) -> dict[str, Any]:
             ),
         )
     return metadata
+
+
+async def _extract_readable_webpage(url: str, max_chars: int) -> dict[str, Any]:
+    res, content_type = await _fetch_url(url)
+    if "html" not in content_type.lower() and not res.text.lstrip().startswith("<"):
+        text = _normalize_text(res.text, max_chars)
+        return {
+            "url": str(res.url),
+            "content_type": content_type,
+            "title": "",
+            "description": "",
+            "text": text,
+            "truncated": text.endswith("...[truncated]"),
+            "links": [],
+        }
+
+    parser = _ReadableHTMLParser()
+    parser.feed(res.text)
+    title = _normalize_text(" ".join(parser.title_parts))
+    description = parser.meta.get("description") or parser.meta.get("og:description") or ""
+    text = _normalize_text("".join(parser.text_parts), max_chars)
+    links = []
+    seen = set()
+    for link in parser.links:
+        link_url = _absolute_url(str(res.url), link["url"])
+        if link_url in seen:
+            continue
+        seen.add(link_url)
+        links.append({"url": link_url})
+        if len(links) >= 30:
+            break
+    return {
+        "url": str(res.url),
+        "content_type": content_type,
+        "title": title,
+        "description": description,
+        "text": text,
+        "truncated": text.endswith("...[truncated]"),
+        "links": links,
+    }
+
+
+async def _resolve_media_candidates(url: str, preferred: str, max_results: int) -> dict[str, Any]:
+    _require_http_url(url)
+    direct: dict[str, Any] | None = None
+    try:
+        async with _client() as client:
+            head = await client.head(url)
+        content_type = head.headers.get("content-type")
+        content_length = head.headers.get("content-length")
+        if _is_media_candidate(url, preferred, content_type):
+            direct = {
+                "url": str(head.url),
+                "type": _guess_media_type(str(head.url), content_type),
+                "content_type": content_type,
+                "content_length": content_length,
+                "source": "direct",
+            }
+    except Exception:
+        if _is_media_candidate(url, preferred):
+            direct = {
+                "url": url,
+                "type": _guess_media_type(url),
+                "content_type": None,
+                "content_length": None,
+                "source": "direct-extension",
+            }
+    if direct:
+        return {"url": url, "resolved_url": direct["url"], "candidates": [direct], "note": "input is already a direct media URL"}
+
+    res, content_type = await _fetch_url(url)
+    if "html" not in content_type.lower() and _is_media_candidate(str(res.url), preferred, content_type):
+        candidate = {
+            "url": str(res.url),
+            "type": _guess_media_type(str(res.url), content_type),
+            "content_type": content_type,
+            "content_length": res.headers.get("content-length"),
+            "source": "direct-get",
+        }
+        return {"url": url, "resolved_url": candidate["url"], "candidates": [candidate], "note": "input resolved to a direct media URL"}
+
+    parser = _ReadableHTMLParser()
+    parser.feed(res.text)
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_candidate(candidate_url: str, source: str, content_hint: str | None = None) -> None:
+        absolute = _absolute_url(str(res.url), candidate_url)
+        if absolute in seen:
+            return
+        if not _is_media_candidate(absolute, preferred, content_hint):
+            return
+        seen.add(absolute)
+        candidates.append(
+            {
+                "url": absolute,
+                "type": _guess_media_type(absolute, content_hint),
+                "content_type": content_hint,
+                "content_length": None,
+                "source": source,
+            }
+        )
+
+    meta_sources = {
+        "og:video": "meta:og:video",
+        "og:video:url": "meta:og:video:url",
+        "og:video:secure_url": "meta:og:video:secure_url",
+        "twitter:player": "meta:twitter:player",
+        "og:image": "meta:og:image",
+        "twitter:image": "meta:twitter:image",
+    }
+    for key, source in meta_sources.items():
+        value = parser.meta.get(key)
+        if value:
+            add_candidate(value, source)
+
+    for item in parser.media:
+        add_candidate(item["url"], item["source"], item.get("type"))
+
+    regex = re.compile(r'https?://[^"\'<>\s]+?\.(?:mp4|webm|mov|m4v|m3u8|mpd|jpg|jpeg|png|webp|gif|avif)(?:\?[^"\'<>\s]*)?', re.I)
+    for match in regex.finditer(res.text):
+        add_candidate(match.group(0), "html-regex")
+        if len(candidates) >= max_results:
+            break
+
+    return {
+        "url": url,
+        "resolved_url": candidates[0]["url"] if candidates else None,
+        "candidates": candidates[:max_results],
+        "note": (
+            "Only direct media URLs and simple HTML media/meta tags are resolved. "
+            "JavaScript-only players such as many YouTube/TikTok/X pages may not expose a direct file URL."
+        ),
+    }
 
 
 async def _brave_web_search(query: str, max_results: int) -> list[dict[str, Any]]:
@@ -293,7 +560,14 @@ async def root() -> dict[str, Any]:
         "name": APP_TITLE,
         "status": "ok",
         "openapi_url": "/openapi.json",
-        "tools": ["search_web", "search_images", "inspect_image", "inspect_video"],
+        "tools": [
+            "search_web",
+            "read_webpage",
+            "search_images",
+            "resolve_media_url",
+            "inspect_image",
+            "inspect_video",
+        ],
     }
 
 
@@ -309,6 +583,17 @@ async def search_web(req: WebSearchRequest) -> dict[str, Any]:
     return {"query": req.query, "results": results}
 
 
+@app.post("/read_webpage", operation_id="read_webpage")
+async def read_webpage(req: ReadWebpageRequest) -> dict[str, Any]:
+    """Fetch a webpage and return readable title, metadata, text, and links."""
+    try:
+        return await _extract_readable_webpage(req.url, req.max_chars)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"webpage read failed: {exc}") from exc
+
+
 @app.post("/search_images", operation_id="search_images")
 async def search_images(req: ImageSearchRequest) -> dict[str, Any]:
     """Search images and return image URLs, thumbnails, and source pages."""
@@ -321,6 +606,17 @@ async def search_images(req: ImageSearchRequest) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"image search failed: {exc}") from exc
     return {"query": req.query, "results": results}
+
+
+@app.post("/resolve_media_url", operation_id="resolve_media_url")
+async def resolve_media_url(req: ResolveMediaUrlRequest) -> dict[str, Any]:
+    """Resolve a direct media URL or find media candidates from a webpage."""
+    try:
+        return await _resolve_media_candidates(req.url, req.media_type, req.max_results)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"media URL resolution failed: {exc}") from exc
 
 
 @app.post("/inspect_image", operation_id="inspect_image")
