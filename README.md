@@ -83,6 +83,7 @@ Open WebUI의 native tool calling을 쓰려면 이것도 필요합니다.
 
 ```bash
 --tool-call-parser gemma4
+--enable-auto-tool-choice
 ```
 
 ## 4. Start Open WebUI

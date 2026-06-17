@@ -26,6 +26,7 @@ exec vllm serve "${MODEL}" \
   --default-chat-template-kwargs '{"enable_thinking":true}' \
   --reasoning-parser gemma4 \
   --tool-call-parser gemma4 \
+  --enable-auto-tool-choice \
   --trust-remote-code \
   --enforce-eager \
   --api-key "${SERVE_API_KEY:-sk-test}"
